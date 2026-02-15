@@ -7,6 +7,7 @@
 
 from .actor_critic import ActorCritic
 from .actor_critic_recurrent import ActorCriticRecurrent
+from .multi_teacher_student_teacher import MultiTeacherStudentTeacher
 from .normalizer import EmpiricalNormalization
 from .rnd import RandomNetworkDistillation
 from .student_teacher import StudentTeacher
@@ -16,6 +17,7 @@ __all__ = [
     "ActorCritic",
     "ActorCriticRecurrent",
     "EmpiricalNormalization",
+    "MultiTeacherStudentTeacher",
     "RandomNetworkDistillation",
     "StudentTeacher",
     "StudentTeacherRecurrent",

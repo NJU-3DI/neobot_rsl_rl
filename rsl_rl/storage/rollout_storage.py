@@ -63,7 +63,7 @@ class RolloutStorage:
         self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
 
         # for distillation
-        if training_type == "distillation":
+        if training_type == "distillation" or training_type == "multi_teacher_distillation":
             self.privileged_actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
 
         # for reinforcement learning
@@ -100,7 +100,7 @@ class RolloutStorage:
         self.dones[self.step].copy_(transition.dones.view(-1, 1))
 
         # for distillation
-        if self.training_type == "distillation":
+        if self.training_type == "distillation" or self.training_type == "multi_teacher_distillation":
             self.privileged_actions[self.step].copy_(transition.privileged_actions)
 
         # for reinforcement learning
@@ -168,7 +168,7 @@ class RolloutStorage:
 
     # for distillation
     def generator(self):
-        if self.training_type != "distillation":
+        if self.training_type != "distillation" and self.training_type != "multi_teacher_distillation":
             raise ValueError("This function is only available for distillation training.")
 
         for i in range(self.num_transitions_per_env):

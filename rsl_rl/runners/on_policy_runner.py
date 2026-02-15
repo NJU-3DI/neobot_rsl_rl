@@ -12,12 +12,13 @@ import torch
 from collections import deque
 
 import rsl_rl
-from rsl_rl.algorithms import PPO, Distillation
+from rsl_rl.algorithms import PPO, Distillation, MultiTeacherDistillation
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import (
     ActorCritic,
     ActorCriticRecurrent,
     EmpiricalNormalization,
+    MultiTeacherStudentTeacher,
     StudentTeacher,
     StudentTeacherRecurrent,
 )
@@ -42,6 +43,8 @@ class OnPolicyRunner:
             self.training_type = "rl"
         elif self.alg_cfg["class_name"] == "Distillation":
             self.training_type = "distillation"
+        elif self.alg_cfg["class_name"] == "MultiTeacherDistillation":
+            self.training_type = "multi_teacher_distillation"
         else:
             raise ValueError(f"Training type not found for algorithm {self.alg_cfg['class_name']}.")
 
@@ -55,7 +58,7 @@ class OnPolicyRunner:
                 self.privileged_obs_type = "critic"  # actor-critic reinforcement learnig, e.g., PPO
             else:
                 self.privileged_obs_type = None
-        if self.training_type == "distillation":
+        if self.training_type in ("distillation", "multi_teacher_distillation"):
             if "teacher" in extras["observations"]:
                 self.privileged_obs_type = "teacher"  # policy distillation
             else:
@@ -69,7 +72,7 @@ class OnPolicyRunner:
 
         # evaluate the policy class
         policy_class = eval(self.policy_cfg.pop("class_name"))
-        policy: ActorCritic | ActorCriticRecurrent | StudentTeacher | StudentTeacherRecurrent = policy_class(
+        policy: ActorCritic | ActorCriticRecurrent | StudentTeacher | StudentTeacherRecurrent | MultiTeacherStudentTeacher = policy_class(
             num_obs, num_privileged_obs, self.env.num_actions, **self.policy_cfg
         ).to(self.device)
 
@@ -93,7 +96,7 @@ class OnPolicyRunner:
 
         # initialize algorithm
         alg_class = eval(self.alg_cfg.pop("class_name"))
-        self.alg: PPO | Distillation = alg_class(policy, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg)
+        self.alg: PPO | Distillation | MultiTeacherDistillation = alg_class(policy, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg)
 
         # store training configuration
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
@@ -482,6 +485,37 @@ class OnPolicyRunner:
 
     def add_git_repo_to_log(self, repo_file_path):
         self.git_status_repos.append(repo_file_path)
+
+    def load_teachers(self, checkpoint_dir: str, cluster_range: tuple[int, int] | None = None):
+        """Load multiple teacher models for multi-teacher distillation.
+        
+        Args:
+            checkpoint_dir: Path to directory containing cluster_* subdirectories
+            cluster_range: Optional (min, max) range of clusters to load (inclusive)
+        """
+        if self.training_type != "multi_teacher_distillation":
+            raise ValueError("load_teachers() only supported for multi_teacher_distillation training type.")
+        
+        if not isinstance(self.alg.policy, MultiTeacherStudentTeacher):
+            raise ValueError("Policy must be MultiTeacherStudentTeacher for multi-teacher distillation.")
+        
+        # Load teachers and get normalizer state dicts
+        normalizers = self.alg.policy.load_teachers_from_directory(checkpoint_dir, cluster_range, self.device)
+        
+        # Load privileged_obs_normalizer from first teacher's normalizer
+        if self.empirical_normalization and normalizers:
+            first_cluster_id = min(normalizers.keys())
+            self.privileged_obs_normalizer.load_state_dict(normalizers[first_cluster_id])
+            print(f"[OnPolicyRunner] Loaded privileged_obs_normalizer from cluster {first_cluster_id}")
+
+    def set_cluster_ids(self, cluster_ids: torch.Tensor):
+        """Set cluster IDs for multi-teacher distillation.
+        
+        Args:
+            cluster_ids: Tensor of shape (num_envs,) with cluster ID for each env
+        """
+        if self.training_type == "multi_teacher_distillation":
+            self.alg.set_cluster_ids(cluster_ids)
 
     """
     Helper functions.
