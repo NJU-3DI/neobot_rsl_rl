@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 from torch.distributions import Normal
 
+from rsl_rl.modules.normalizer import EmpiricalNormalization
 from rsl_rl.utils import resolve_nn_activation
 
 
@@ -82,6 +83,7 @@ class MultiTeacherStudentTeacher(nn.Module):
 
         # Multi-teacher storage
         self.teachers: dict[int, nn.Sequential] = {}  # cluster_id -> teacher network
+        self.teacher_normalizers: dict[int, EmpiricalNormalization] = {}  # cluster_id -> obs normalizer
         self.current_cluster_ids: torch.Tensor | None = None
 
         print(f"Student MLP: {self.student}")
@@ -115,7 +117,7 @@ class MultiTeacherStudentTeacher(nn.Module):
         if not checkpoint_path.exists():
             raise ValueError(f"Teacher checkpoint directory not found: {checkpoint_dir}")
         
-        normalizers = {}
+        normalizer_state_dicts = {}
         
         # Find cluster directories
         cluster_dirs = []
@@ -135,15 +137,28 @@ class MultiTeacherStudentTeacher(nn.Module):
         print(f"[MultiTeacherStudentTeacher] Loading {len(cluster_dirs)} teachers...")
         
         for cluster_id, cluster_dir in cluster_dirs:
-            normalizer = self._load_single_teacher(cluster_id, cluster_dir, device)
-            if normalizer is not None:
-                normalizers[cluster_id] = normalizer
+            norm_sd = self._load_single_teacher(cluster_id, cluster_dir, device)
+            if norm_sd is not None:
+                normalizer_state_dicts[cluster_id] = norm_sd
+        
+        # Create per-teacher normalizers from saved state dicts.
+        # In single-teacher distillation the runner loads the RL actor's obs_norm_state_dict
+        # into privileged_obs_normalizer so that teacher observations are normalised with
+        # the same statistics the teacher was trained with.  For multi-teacher distillation
+        # we must do this per teacher – each teacher was trained on a different data
+        # distribution and therefore has different normalisation statistics.
+        for cluster_id, norm_sd in normalizer_state_dicts.items():
+            normalizer = EmpiricalNormalization(shape=[self._num_teacher_obs], until=1.0e8).to(device)
+            normalizer.load_state_dict(norm_sd)
+            normalizer.eval()  # freeze – we are not re-training the teachers
+            self.teacher_normalizers[cluster_id] = normalizer
         
         if self.teachers:
             self.loaded_teacher = True
             print(f"[MultiTeacherStudentTeacher] Loaded teachers for clusters: {sorted(self.teachers.keys())}")
+            print(f"[MultiTeacherStudentTeacher] Loaded normalizers for clusters: {sorted(self.teacher_normalizers.keys())}")
         
-        return normalizers
+        return normalizer_state_dicts
 
     def _load_single_teacher(self, cluster_id: int, cluster_dir: Path, device="cpu") -> dict | None:
         """Load a single teacher from cluster directory.
@@ -210,8 +225,32 @@ class MultiTeacherStudentTeacher(nn.Module):
     def act_inference(self, observations):
         return self.student(observations)
 
+    def _normalize_for_teacher(self, teacher_observations: torch.Tensor, cluster_id: int) -> torch.Tensor:
+        """Normalize observations using the per-teacher normalizer.
+
+        In single-teacher distillation the runner's ``privileged_obs_normalizer``
+        takes care of this.  For multi-teacher distillation each teacher was
+        trained with its own normaliser, so we must apply it here instead.
+
+        If no per-teacher normalizer is available (e.g. the teacher checkpoint
+        did not contain ``obs_norm_state_dict``), the observations are returned
+        unchanged – this keeps backward compatibility with setups that do not
+        use empirical normalisation.
+        """
+        if cluster_id in self.teacher_normalizers:
+            return self.teacher_normalizers[cluster_id](teacher_observations)
+        return teacher_observations
+
     def evaluate(self, teacher_observations):
-        """Get teacher actions based on current cluster IDs."""
+        """Get teacher actions based on current cluster IDs.
+
+        When per-teacher normalizers are present (loaded via
+        ``load_teachers_from_directory``), ``teacher_observations`` are expected
+        to be **raw / unnormalized**.  Each teacher's observations are
+        normalised with its own ``EmpiricalNormalization`` before inference,
+        mirroring what ``privileged_obs_normalizer`` does in the single-teacher
+        distillation path.
+        """
         with torch.no_grad():
             if not self.teachers:
                 return self.teacher(teacher_observations)
@@ -219,14 +258,16 @@ class MultiTeacherStudentTeacher(nn.Module):
             if self.current_cluster_ids is None:
                 # Use first available teacher
                 default_id = min(self.teachers.keys())
-                return self.teachers[default_id](teacher_observations)
+                normed = self._normalize_for_teacher(teacher_observations, default_id)
+                return self.teachers[default_id](normed)
             
             # Optimization for single teacher
             if len(self.teachers) == 1:
                 teacher_id = list(self.teachers.keys())[0]
-                return self.teachers[teacher_id](teacher_observations)
+                normed = self._normalize_for_teacher(teacher_observations, teacher_id)
+                return self.teachers[teacher_id](normed)
             
-            # Multi-teacher: select based on cluster ID
+            # Multi-teacher: select & normalize based on cluster ID
             num_envs = teacher_observations.shape[0]
             device = teacher_observations.device
             actions = torch.zeros(num_envs, self._num_actions, device=device)
@@ -234,13 +275,17 @@ class MultiTeacherStudentTeacher(nn.Module):
             for cluster_id in torch.unique(self.current_cluster_ids):
                 cluster_id_int = cluster_id.item()
                 mask = (self.current_cluster_ids == cluster_id)
+                obs_subset = teacher_observations[mask]
                 
                 if cluster_id_int in self.teachers:
-                    actions[mask] = self.teachers[cluster_id_int](teacher_observations[mask])
+                    normed = self._normalize_for_teacher(obs_subset, cluster_id_int)
+                    actions[mask] = self.teachers[cluster_id_int](normed)
                 else:
                     # Fallback to nearest available teacher
                     nearest_id = self._find_nearest_teacher(cluster_id_int)
-                    actions[mask] = self.teachers[nearest_id](teacher_observations[mask])
+                    print(f"[WARNING] No teacher for cluster {cluster_id_int}, using nearest teacher {nearest_id} ({mask.sum().item()} envs)")
+                    normed = self._normalize_for_teacher(obs_subset, nearest_id)
+                    actions[mask] = self.teachers[nearest_id](normed)
             
             return actions
 

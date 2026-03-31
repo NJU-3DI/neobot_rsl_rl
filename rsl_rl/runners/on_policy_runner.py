@@ -210,9 +210,16 @@ class OnPolicyRunner:
                     # perform normalization
                     obs = self.obs_normalizer(obs)
                     if self.privileged_obs_type is not None:
-                        privileged_obs = self.privileged_obs_normalizer(
-                            infos["observations"][self.privileged_obs_type].to(self.device)
-                        )
+                        if self.training_type == "multi_teacher_distillation":
+                            # For multi-teacher distillation, pass raw (unnormalized) teacher
+                            # observations.  Per-teacher normalization is applied inside
+                            # MultiTeacherStudentTeacher.evaluate() using each teacher's own
+                            # EmpiricalNormalization (loaded from each teacher's checkpoint).
+                            privileged_obs = infos["observations"][self.privileged_obs_type].to(self.device)
+                        else:
+                            privileged_obs = self.privileged_obs_normalizer(
+                                infos["observations"][self.privileged_obs_type].to(self.device)
+                            )
                     else:
                         privileged_obs = obs
 
@@ -499,14 +506,17 @@ class OnPolicyRunner:
         if not isinstance(self.alg.policy, MultiTeacherStudentTeacher):
             raise ValueError("Policy must be MultiTeacherStudentTeacher for multi-teacher distillation.")
         
-        # Load teachers and get normalizer state dicts
-        normalizers = self.alg.policy.load_teachers_from_directory(checkpoint_dir, cluster_range, self.device)
+        # Load teachers and their per-teacher normalizers.
+        # Unlike single-teacher distillation where we load the RL actor's
+        # obs_norm_state_dict into the runner's privileged_obs_normalizer,
+        # for multi-teacher distillation each teacher needs its own normalizer.
+        # These are stored inside MultiTeacherStudentTeacher and applied
+        # automatically in evaluate().
+        normalizer_state_dicts = self.alg.policy.load_teachers_from_directory(checkpoint_dir, cluster_range, self.device)
         
-        # Load privileged_obs_normalizer from first teacher's normalizer
-        if self.empirical_normalization and normalizers:
-            first_cluster_id = min(normalizers.keys())
-            self.privileged_obs_normalizer.load_state_dict(normalizers[first_cluster_id])
-            print(f"[OnPolicyRunner] Loaded privileged_obs_normalizer from cluster {first_cluster_id}")
+        if normalizer_state_dicts:
+            print(f"[OnPolicyRunner] Loaded per-teacher normalizers for {len(normalizer_state_dicts)} clusters "
+                  f"(runner's privileged_obs_normalizer is NOT used for multi-teacher distillation)")
 
     def set_cluster_ids(self, cluster_ids: torch.Tensor):
         """Set cluster IDs for multi-teacher distillation.
