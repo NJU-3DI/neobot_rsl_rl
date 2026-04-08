@@ -8,7 +8,6 @@
 from __future__ import annotations
 
 import copy
-import os
 import re
 from pathlib import Path
 
@@ -18,6 +17,8 @@ from torch.distributions import Normal
 
 from rsl_rl.modules.normalizer import EmpiricalNormalization
 from rsl_rl.utils import resolve_nn_activation
+
+from .actor_critic_transformer import ActorCriticTransformer
 
 
 class MultiTeacherStudentTeacher(nn.Module):
@@ -38,47 +39,40 @@ class MultiTeacherStudentTeacher(nn.Module):
         teacher_hidden_dims=[256, 256, 256],
         activation="elu",
         init_noise_std=0.1,
+        student_class_name="MLP",
+        noise_std_type: str = "scalar",
         **kwargs,
     ):
-        if kwargs:
-            print(
-                "MultiTeacherStudentTeacher.__init__ got unexpected arguments, which will be ignored: "
-                + str([key for key in kwargs.keys()])
-            )
         super().__init__()
-        activation = resolve_nn_activation(activation)
         self.loaded_teacher = False
+        self.student_class_name = student_class_name
+        self._activation_name = activation
 
-        mlp_input_dim_s = num_student_obs
         mlp_input_dim_t = num_teacher_obs
         self._teacher_hidden_dims = teacher_hidden_dims
-        self._activation = activation
         self._num_actions = num_actions
         self._num_teacher_obs = num_teacher_obs
 
         # Student network
-        student_layers = []
-        student_layers.append(nn.Linear(mlp_input_dim_s, student_hidden_dims[0]))
-        student_layers.append(activation)
-        for layer_index in range(len(student_hidden_dims)):
-            if layer_index == len(student_hidden_dims) - 1:
-                student_layers.append(nn.Linear(student_hidden_dims[layer_index], num_actions))
-            else:
-                student_layers.append(nn.Linear(student_hidden_dims[layer_index], student_hidden_dims[layer_index + 1]))
-                student_layers.append(activation)
-        self.student = nn.Sequential(*student_layers)
+        self.student, unexpected_student_kwargs = self._build_student_network(
+            num_student_obs=num_student_obs,
+            num_teacher_obs=num_teacher_obs,
+            num_actions=num_actions,
+            student_hidden_dims=student_hidden_dims,
+            activation=activation,
+            init_noise_std=init_noise_std,
+            noise_std_type=noise_std_type,
+            kwargs=kwargs,
+        )
+        self.is_recurrent = self.student.is_recurrent if hasattr(self.student, "is_recurrent") else False
+        if unexpected_student_kwargs:
+            print(
+                "MultiTeacherStudentTeacher.__init__ got unexpected arguments, which will be ignored: "
+                + str(unexpected_student_kwargs)
+            )
 
         # Default teacher (used as template for creating new teachers)
-        teacher_layers = []
-        teacher_layers.append(nn.Linear(mlp_input_dim_t, teacher_hidden_dims[0]))
-        teacher_layers.append(activation)
-        for layer_index in range(len(teacher_hidden_dims)):
-            if layer_index == len(teacher_hidden_dims) - 1:
-                teacher_layers.append(nn.Linear(teacher_hidden_dims[layer_index], num_actions))
-            else:
-                teacher_layers.append(nn.Linear(teacher_hidden_dims[layer_index], teacher_hidden_dims[layer_index + 1]))
-                teacher_layers.append(activation)
-        self.teacher = nn.Sequential(*teacher_layers)
+        self.teacher = self._build_mlp(mlp_input_dim_t, teacher_hidden_dims, num_actions)
         self.teacher.eval()
 
         # Multi-teacher storage
@@ -86,13 +80,53 @@ class MultiTeacherStudentTeacher(nn.Module):
         self.teacher_normalizers: dict[int, EmpiricalNormalization] = {}  # cluster_id -> obs normalizer
         self.current_cluster_ids: torch.Tensor | None = None
 
-        print(f"Student MLP: {self.student}")
+        print(f"Student network ({self.student_class_name}): {self.student}")
         print(f"Teacher MLP template: {self.teacher}")
 
         # Action noise
-        self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
+        self.std = nn.Parameter(init_noise_std * torch.ones(num_actions)) if not self.is_recurrent else None
         self.distribution = None
         Normal.set_default_validate_args = False
+
+    def _build_mlp(self, input_dim: int, hidden_dims: list[int], output_dim: int) -> nn.Sequential:
+        layers = [nn.Linear(input_dim, hidden_dims[0]), resolve_nn_activation(self._activation_name)]
+        for layer_index in range(len(hidden_dims)):
+            if layer_index == len(hidden_dims) - 1:
+                layers.append(nn.Linear(hidden_dims[layer_index], output_dim))
+            else:
+                layers.append(nn.Linear(hidden_dims[layer_index], hidden_dims[layer_index + 1]))
+                layers.append(resolve_nn_activation(self._activation_name))
+        return nn.Sequential(*layers)
+
+    def _build_student_network(
+        self,
+        num_student_obs: int,
+        num_teacher_obs: int,
+        num_actions: int,
+        student_hidden_dims: list[int],
+        activation: str,
+        init_noise_std: float,
+        noise_std_type: str,
+        kwargs: dict,
+    ) -> tuple[nn.Module, list[str]]:
+        if self.student_class_name == "MLP":
+            return self._build_mlp(num_student_obs, student_hidden_dims, num_actions), sorted(kwargs.keys())
+
+        if self.student_class_name != "ActorCriticTransformer":
+            raise ValueError(f"Unsupported student_class_name: {self.student_class_name}")
+
+        student = ActorCriticTransformer(
+            num_actor_obs=num_student_obs,
+            num_critic_obs=num_teacher_obs,
+            num_actions=num_actions,
+            actor_hidden_dims=student_hidden_dims,
+            critic_hidden_dims=self._teacher_hidden_dims,
+            activation=activation,
+            init_noise_std=init_noise_std,
+            noise_std_type=noise_std_type,
+            **kwargs,
+        )
+        return student, []
 
     def _create_teacher_network(self) -> nn.Sequential:
         """Create a new teacher network with the same architecture."""
@@ -196,33 +230,51 @@ class MultiTeacherStudentTeacher(nn.Module):
         return checkpoint.get("obs_norm_state_dict")
 
     def reset(self, dones=None, hidden_states=None):
-        pass
+        if self.is_recurrent:
+            student_hidden_states = None if hidden_states is None else hidden_states[0]
+            self.student.reset(dones=dones, hidden_states=student_hidden_states)
 
     def forward(self):
         raise NotImplementedError
 
     @property
     def action_mean(self):
+        if self.is_recurrent:
+            return self.student.action_mean
         return self.distribution.mean
 
     @property
     def action_std(self):
+        if self.is_recurrent:
+            return self.student.action_std
         return self.distribution.stddev
 
     @property
     def entropy(self):
+        if self.is_recurrent:
+            return self.student.entropy
         return self.distribution.entropy().sum(dim=-1)
 
-    def update_distribution(self, observations):
+    def update_distribution(self, observations, masks=None, hidden_states=None):
+        if self.is_recurrent:
+            actions = self.student.act(observations, masks=masks, hidden_states=hidden_states)
+            self.distribution = self.student.distribution
+            return actions
         mean = self.student(observations)
-        std = self.std.expand_as(mean)
+        std = self.std.expand_as(mean)  # type: ignore[union-attr]
         self.distribution = Normal(mean, std)
+        return None
 
-    def act(self, observations):
-        self.update_distribution(observations)
+    def act(self, observations, masks=None, hidden_states=None):
+        if self.is_recurrent:
+            actions = self.update_distribution(observations, masks=masks, hidden_states=hidden_states)
+            return actions
+        self.update_distribution(observations, masks=masks, hidden_states=hidden_states)
         return self.distribution.sample()
 
-    def act_inference(self, observations):
+    def act_inference(self, observations, masks=None, hidden_states=None):
+        if self.is_recurrent:
+            return self.student.act_inference(observations, masks=masks, hidden_states=hidden_states)
         return self.student(observations)
 
     def _normalize_for_teacher(self, teacher_observations: torch.Tensor, cluster_id: int) -> torch.Tensor:
@@ -326,7 +378,10 @@ class MultiTeacherStudentTeacher(nn.Module):
             raise ValueError("state_dict does not contain student or actor parameters")
 
     def get_hidden_states(self):
+        if self.is_recurrent:
+            return self.student.get_hidden_states(), None
         return None
 
     def detach_hidden_states(self, dones=None):
-        pass
+        if self.is_recurrent:
+            self.student.detach_hidden_states(dones)

@@ -6,5 +6,6 @@
 """Definitions for neural networks."""
 
 from .memory import Memory
+from .transformer import RGMTMemory, TransformerMemory
 
-__all__ = ["Memory"]
+__all__ = ["Memory", "RGMTMemory", "TransformerMemory"]
