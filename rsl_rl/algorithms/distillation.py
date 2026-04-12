@@ -27,6 +27,10 @@ class Distillation:
         learning_rate=1e-3,
         loss_type="mse",
         device="cpu",
+        # LR scheduler parameters
+        schedule: str | None = None,
+        min_lr: float = 1e-5,
+        scheduler_T_max: int = 10000,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
     ):
@@ -48,6 +52,11 @@ class Distillation:
         self.policy.to(self.device)
         self.storage = None  # initialized later
         self.optimizer = optim.Adam(self.policy.student.parameters(), lr=learning_rate)
+        self.scheduler = None
+        if schedule == "cosine":
+            self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer, T_max=scheduler_T_max, eta_min=min_lr
+            )
         self.transition = RolloutStorage.Transition()
         self.last_hidden_states = None
 
@@ -136,6 +145,9 @@ class Distillation:
                 self.policy.detach_hidden_states(dones.view(-1))
 
         mean_behavior_loss /= cnt
+        if self.scheduler is not None:
+            self.scheduler.step()
+            self.learning_rate = self.optimizer.param_groups[0]["lr"]
         self.storage.clear()
         self.last_hidden_states = self.policy.get_hidden_states()
         self.policy.detach_hidden_states()

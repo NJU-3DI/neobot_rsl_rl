@@ -361,19 +361,21 @@ class MultiTeacherStudentTeacher(nn.Module):
         Returns:
             bool: True if resuming distillation training, False if loading from RL training
         """
-        if any("actor" in key for key in state_dict.keys()):
-            # Loading from RL training - load into default teacher
-            teacher_state_dict = {k.replace("actor.", ""): v for k, v in state_dict.items() if "actor." in k}
-            self.teacher.load_state_dict(teacher_state_dict, strict=strict)
-            self.loaded_teacher = True
-            self.teacher.eval()
-            return False
-        elif any("student" in key for key in state_dict.keys()):
+        # Distillation checkpoints store the whole module and use "student.*" keys.
+        # Check this first to avoid matching "student.actor.*" as RL actor weights.
+        if any(key.startswith("student.") for key in state_dict.keys()):
             # Resuming distillation training
             super().load_state_dict(state_dict, strict=strict)
             self.loaded_teacher = True
             self.teacher.eval()
             return True
+        elif any(key.startswith("actor.") for key in state_dict.keys()):
+            # Loading from RL training - load into default teacher
+            teacher_state_dict = {k.replace("actor.", ""): v for k, v in state_dict.items() if k.startswith("actor.")}
+            self.teacher.load_state_dict(teacher_state_dict, strict=strict)
+            self.loaded_teacher = True
+            self.teacher.eval()
+            return False
         else:
             raise ValueError("state_dict does not contain student or actor parameters")
 
