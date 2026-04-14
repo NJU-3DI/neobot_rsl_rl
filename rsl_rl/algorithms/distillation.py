@@ -31,6 +31,9 @@ class Distillation:
         schedule: str | None = None,
         min_lr: float = 1e-5,
         scheduler_T_max: int = 10000,
+        # Adaptive KL parameters (used when schedule == "adaptive_kl")
+        desired_kl: float = 0.01,
+        max_lr: float = 1e-2,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
     ):
@@ -53,7 +56,12 @@ class Distillation:
         self.storage = None  # initialized later
         self.optimizer = optim.Adam(self.policy.student.parameters(), lr=learning_rate)
         self.scheduler = None
-        if schedule == "cosine":
+        self.desired_kl = None
+        if schedule == "adaptive_kl":
+            self.desired_kl = desired_kl
+            self.min_lr = min_lr
+            self.max_lr = max_lr
+        elif schedule == "cosine":
             self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
                 self.optimizer, T_max=scheduler_T_max, eta_min=min_lr
             )
@@ -114,6 +122,14 @@ class Distillation:
         loss = 0
         cnt = 0
 
+        # Snapshot old student distribution for adaptive KL (non-recurrent only)
+        if self.desired_kl is not None and not self.policy.is_recurrent:
+            with torch.inference_mode():
+                obs_all = self.storage.observations.view(-1, self.storage.observations.shape[-1])
+                self.policy.update_distribution(obs_all)
+                mu_old = self.policy.action_mean.detach().clone()
+                sigma_old = self.policy.action_std.detach().clone()
+
         for epoch in range(self.num_learning_epochs):
             self.policy.reset(hidden_states=self.last_hidden_states)
             self.policy.detach_hidden_states()
@@ -145,6 +161,28 @@ class Distillation:
                 self.policy.detach_hidden_states(dones.view(-1))
 
         mean_behavior_loss /= cnt
+
+        # Adaptive KL learning rate update
+        kl_mean = None
+        if self.desired_kl is not None and not self.policy.is_recurrent:
+            with torch.inference_mode():
+                self.policy.update_distribution(obs_all)
+                mu_new = self.policy.action_mean
+                sigma_new = self.policy.action_std
+                kl = torch.sum(
+                    torch.log(sigma_new / sigma_old + 1.0e-5)
+                    + (sigma_old.pow(2) + (mu_old - mu_new).pow(2)) / (2.0 * sigma_new.pow(2))
+                    - 0.5,
+                    dim=-1,
+                )
+                kl_mean = kl.mean()
+                if kl_mean > self.desired_kl * 2.0:
+                    self.learning_rate = max(self.min_lr, self.learning_rate / 1.5)
+                elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
+                    self.learning_rate = min(self.max_lr, self.learning_rate * 1.5)
+                for param_group in self.optimizer.param_groups:
+                    param_group["lr"] = self.learning_rate
+
         if self.scheduler is not None:
             self.scheduler.step()
             self.learning_rate = self.optimizer.param_groups[0]["lr"]
@@ -154,6 +192,8 @@ class Distillation:
 
         # construct the loss dictionary
         loss_dict = {"behavior": mean_behavior_loss}
+        if kl_mean is not None:
+            loss_dict["kl"] = kl_mean.item()
 
         return loss_dict
 
