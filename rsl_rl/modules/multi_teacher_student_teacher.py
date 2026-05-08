@@ -8,7 +8,6 @@
 from __future__ import annotations
 
 import copy
-import re
 from pathlib import Path
 
 import torch
@@ -19,6 +18,9 @@ from rsl_rl.modules.normalizer import EmpiricalNormalization
 from rsl_rl.utils import resolve_nn_activation
 
 from .actor_critic_transformer import ActorCriticTransformer
+
+
+_LOAD_FAILED = object()
 
 
 class MultiTeacherStudentTeacher(nn.Module):
@@ -152,7 +154,7 @@ class MultiTeacherStudentTeacher(nn.Module):
             raise ValueError(f"Teacher checkpoint directory not found: {checkpoint_dir}")
         
         normalizer_state_dicts = {}
-        
+
         # Find cluster directories
         cluster_dirs = []
         for item in checkpoint_path.iterdir():
@@ -163,17 +165,19 @@ class MultiTeacherStudentTeacher(nn.Module):
                         cluster_dirs.append((cluster_id, item))
                 except (ValueError, IndexError):
                     continue
-        
+
         if not cluster_dirs:
             raise ValueError(f"No valid cluster directories found in {checkpoint_dir}")
-        
+
         cluster_dirs.sort(key=lambda x: x[0])
-        print(f"[MultiTeacherStudentTeacher] Loading {len(cluster_dirs)} teachers...")
-        
+        print(f"[MultiTeacherStudentTeacher] Found {len(cluster_dirs)} candidate cluster directories...")
+
         for cluster_id, cluster_dir in cluster_dirs:
-            norm_sd = self._load_single_teacher(cluster_id, cluster_dir, device)
-            if norm_sd is not None:
-                normalizer_state_dicts[cluster_id] = norm_sd
+            result = self._load_single_teacher(cluster_id, cluster_dir, device)
+            if result is _LOAD_FAILED:
+                print(f"[MultiTeacherStudentTeacher] Cluster {cluster_id}: no .pt files found, skipping")
+            elif result is not None:
+                normalizer_state_dicts[cluster_id] = result
         
         # Create per-teacher normalizers from saved state dicts.
         # In single-teacher distillation the runner loads the RL actor's obs_norm_state_dict
@@ -192,7 +196,8 @@ class MultiTeacherStudentTeacher(nn.Module):
             print(f"[MultiTeacherStudentTeacher] Loaded teachers for clusters: {sorted(self.teachers.keys())}")
             print(f"[MultiTeacherStudentTeacher] Loaded normalizers for clusters: {sorted(self.teacher_normalizers.keys())}")
         
-        return normalizer_state_dicts
+        loaded_cluster_ids: set[int] = set(self.teachers.keys())
+        return normalizer_state_dicts, loaded_cluster_ids
 
     def _load_single_teacher(self, cluster_id: int, cluster_dir: Path, device="cpu") -> dict | None:
         """Load a single teacher from cluster directory.
@@ -202,14 +207,9 @@ class MultiTeacherStudentTeacher(nn.Module):
         """
         model_files = list(cluster_dir.glob("model_*.pt"))
         if not model_files:
-            print(f"[MultiTeacherStudentTeacher] Warning: No model files in {cluster_dir}")
-            return None
-        
-        def get_iteration(path: Path) -> int:
-            match = re.search(r"model_(\d+)\.pt", path.name)
-            return int(match.group(1)) if match else 0
-        
-        latest_model = max(model_files, key=get_iteration)
+            return _LOAD_FAILED
+
+        latest_model = max(model_files, key=lambda p: p.stat().st_mtime)
         print(f"[MultiTeacherStudentTeacher] Loading cluster {cluster_id} from {latest_model.name}")
         
         checkpoint = torch.load(latest_model, weights_only=False)

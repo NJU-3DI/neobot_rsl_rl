@@ -512,11 +512,15 @@ class OnPolicyRunner:
         # for multi-teacher distillation each teacher needs its own normalizer.
         # These are stored inside MultiTeacherStudentTeacher and applied
         # automatically in evaluate().
-        normalizer_state_dicts = self.alg.policy.load_teachers_from_directory(checkpoint_dir, cluster_range, self.device)
-        
+        normalizer_state_dicts, loaded_cluster_ids = self.alg.policy.load_teachers_from_directory(
+            checkpoint_dir, cluster_range, self.device
+        )
+
         if normalizer_state_dicts:
             print(f"[OnPolicyRunner] Loaded per-teacher normalizers for {len(normalizer_state_dicts)} clusters "
                   f"(runner's privileged_obs_normalizer is NOT used for multi-teacher distillation)")
+
+        return loaded_cluster_ids
 
     def set_cluster_ids(self, cluster_ids: torch.Tensor):
         """Set cluster IDs for multi-teacher distillation.
